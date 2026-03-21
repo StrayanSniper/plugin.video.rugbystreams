@@ -46,7 +46,18 @@ if errorlevel 1 (
 )
 
 :: ---------------------------------------------------------------------------
-:: 3. Run build.py in sniper-repo
+:: 3. Sync addon into sniper-repo (so build.py sees the updated version)
+:: ---------------------------------------------------------------------------
+echo [deploy] Syncing addon into sniper-repo...
+robocopy "%ADDON_DIR%" "%SNIPER_DIR%\plugin.video.rugbystreams" /MIR /XD .git __pycache__ /XF deploy.bat bump_version.py /NJH /NJS
+:: robocopy exit codes 0-7 are success (8+ are errors)
+if errorlevel 8 (
+    echo [deploy] ERROR: robocopy sync failed
+    exit /b 1
+)
+
+:: ---------------------------------------------------------------------------
+:: 4. Run build.py in sniper-repo
 :: ---------------------------------------------------------------------------
 echo [deploy] Running build.py in sniper-repo...
 cd /d "%SNIPER_DIR%"
@@ -57,7 +68,7 @@ if errorlevel 1 (
 )
 
 :: ---------------------------------------------------------------------------
-:: 4. Commit and push the sniper-repo
+:: 5. Commit and push the sniper-repo
 :: ---------------------------------------------------------------------------
 echo [deploy] Committing sniper-repo...
 git add -A
