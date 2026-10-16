@@ -16,28 +16,61 @@ import urllib.parse
 import urllib.request
 import html.parser
 
-def _sydney_utc_offset():
-    """Return Sydney's current UTC offset (10 = AEST, 11 = AEDT), no imports needed."""
+def _site_to_nsw_offset():
+    """
+    rugbybox.me stores times in UK time (BST=UTC+1 in summer, GMT=UTC+0 in winter).
+    NSW is AEST=UTC+10 (Apr-Oct) or AEDT=UTC+11 (Oct-Apr).
+    Returns hours to add to site time to get NSW time.
+    """
     today = datetime.date.today()
     year  = today.year
-    # DST ends first Sunday in April; starts first Sunday in October
-    april1  = datetime.date(year, 4,  1)
-    dst_end = april1  + datetime.timedelta(days=(6 - april1.weekday())  % 7)
-    oct1    = datetime.date(year, 10, 1)
-    dst_start = oct1 + datetime.timedelta(days=(6 - oct1.weekday()) % 7)
-    return 10 if dst_end <= today < dst_start else 11
+
+    def _last_sunday(year, month):
+        d = datetime.date(year, month, 28)
+        # find last day of month
+        import calendar
+        last = datetime.date(year, month, calendar.monthrange(year, month)[1])
+        while last.weekday() != 6:
+            last -= datetime.timedelta(days=1)
+        return last
+
+    def _first_sunday(year, month):
+        d = datetime.date(year, month, 1)
+        while d.weekday() != 6:
+            d += datetime.timedelta(days=1)
+        return d
+
+    uk_bst  = _last_sunday(year, 3) <= today < _last_sunday(year, 10)
+    uk_off  = 1 if uk_bst else 0
+
+    nsw_aest = _first_sunday(year, 4) <= today < _first_sunday(year, 10)
+    nsw_off  = 10 if nsw_aest else 11
+
+    return nsw_off - uk_off
 
 
-def _to_sydney_time(title):
-    """Convert a leading HH:MM UTC time in a match title to Australia/Sydney time."""
-    m = re.match(r'^(\d{2}):(\d{2})(.*)', title)
+def _to_local_time(title):
+    m = re.match(r'^(\d{1,2}):(\d{2})(.*)', title)
     if not m:
         return title
     hh, mm, rest = int(m.group(1)), int(m.group(2)), m.group(3)
-    offset = _sydney_utc_offset()
+    offset = _site_to_nsw_offset()
     total  = hh * 60 + mm + offset * 60
     hh, mm = (total // 60) % 24, total % 60
     return f'{hh:02d}:{mm:02d}{rest}'
+
+
+def _epoch_to_nsw(ts):
+    """Convert a UTC epoch (viprow) to a NSW datetime."""
+    utc = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+    d   = utc.date()
+
+    def _first_sunday(month):
+        first = datetime.date(d.year, month, 1)
+        return first + datetime.timedelta(days=(6 - first.weekday()) % 7)
+
+    nsw_off = 10 if _first_sunday(4) <= d < _first_sunday(10) else 11
+    return utc + datetime.timedelta(hours=nsw_off)
 
 import xbmc
 import xbmcgui
@@ -59,6 +92,7 @@ TEMP_URL_FILE = os.path.join(_KODI_TEMP, 'rugbystreams.url')
 if ADDON_DIR not in sys.path:
     sys.path.insert(0, ADDON_DIR)
 import extractor_runner_no_chrome as _extractor
+import extractor_viprow as _viprow
 
 HEADERS = {
     'User-Agent': (
@@ -88,8 +122,9 @@ class MatchParser(html.parser.HTMLParser):
             return
         attrs = dict(attrs)
         href  = attrs.get('href', '')
-        if (href and href.startswith('/') and href.endswith('-stream')
-                and href.count('/') == 2):
+        if (href and href.startswith('/')
+                and href.count('/') >= 2
+                and (href.endswith('-stream') or re.search(r'/stream-\d+$', href))):
             self._current_href  = 'https://rugbybox.me' + href
             self._current_title = ''
             self._capture       = True
@@ -110,32 +145,31 @@ class MatchParser(html.parser.HTMLParser):
 
 
 def get_matches():
-    req = urllib.request.Request(SITE_URL, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        html_bytes = resp.read().decode('utf-8', errors='replace')
+    import requests as _req
+    resp = _req.get(SITE_URL, headers=HEADERS, timeout=15, verify=False)
+    resp.raise_for_status()
     parser = MatchParser()
-    parser.feed(html_bytes)
+    parser.feed(resp.text)
     return parser.matches
 
 
 def list_matches():
+    # A rugbybox failure shouldn't hide the VipRow folder, so keep going with
+    # an empty list rather than ending the directory.
     try:
         matches = get_matches()
     except Exception as exc:
+        matches = []
         xbmcgui.Dialog().notification(
             'Rugby Streams', f'Failed to load matches: {exc}',
             xbmcgui.NOTIFICATION_ERROR, 5000
         )
-        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
-        return
-
-    if not matches:
-        xbmcgui.Dialog().notification(
-            'Rugby Streams', 'No matches found',
-            xbmcgui.NOTIFICATION_INFO, 4000
-        )
-        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
-        return
+    else:
+        if not matches:
+            xbmcgui.Dialog().notification(
+                'Rugby Streams', 'No matches found',
+                xbmcgui.NOTIFICATION_INFO, 4000
+            )
 
     xbmcplugin.setContent(HANDLE, 'videos')
 
@@ -143,8 +177,11 @@ def list_matches():
     li_refresh = xbmcgui.ListItem(label='[B]⟳ Refresh[/B]')
     xbmcplugin.addDirectoryItem(HANDLE, BASE_URL + '?action=refresh', li_refresh, True)
 
+    li_viprow = xbmcgui.ListItem(label='[B]VipRow Rugby ›[/B]')
+    xbmcplugin.addDirectoryItem(HANDLE, BASE_URL + '?action=viprow', li_viprow, True)
+
     for match in matches:
-        title = _to_sydney_time(match['title'])
+        title = _to_local_time(match['title'])
         li = xbmcgui.ListItem(label=title)
         li.setInfo('video', {'title': title, 'mediatype': 'video'})
         li.setProperty('IsPlayable', 'true')
@@ -157,14 +194,84 @@ def list_matches():
 
 
 # ---------------------------------------------------------------------------
+# VipRow listing
+# ---------------------------------------------------------------------------
+
+def list_viprow_games():
+    try:
+        games = _viprow.get_games()
+    except Exception as exc:
+        xbmcgui.Dialog().notification(
+            'Rugby Streams', f'Failed to load VipRow: {exc}',
+            xbmcgui.NOTIFICATION_ERROR, 5000
+        )
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
+
+    xbmcplugin.setContent(HANDLE, 'videos')
+
+    li_refresh = xbmcgui.ListItem(label='[B]⟳ Refresh[/B]')
+    xbmcplugin.addDirectoryItem(HANDLE, BASE_URL + '?action=refresh', li_refresh, True)
+
+    if not games:
+        li = xbmcgui.ListItem(label='No games scheduled')
+        xbmcplugin.addDirectoryItem(HANDLE, '', li, False)
+
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    for game in games:
+        when  = _epoch_to_nsw(game['start']).strftime('%a %H:%M')
+        live  = '[COLOR red]LIVE[/COLOR] ' if game['start'] <= now < game['end'] else ''
+        title = f"{live}{when}  {game['name']}  [COLOR grey]{game['league']}[/COLOR]"
+        li = xbmcgui.ListItem(label=title)
+        li.setInfo('video', {'title': title, 'plot': f"{game['league']}\n{game['name']}"})
+        url = '{}?action=viprow_game&url={}'.format(
+            BASE_URL, urllib.parse.quote(game['url'], safe='')
+        )
+        xbmcplugin.addDirectoryItem(HANDLE, url, li, True)
+
+    xbmcplugin.endOfDirectory(HANDLE)
+
+
+def list_viprow_links(game_url):
+    try:
+        links = _viprow.get_links(game_url)
+    except Exception as exc:
+        xbmcgui.Dialog().notification(
+            'Rugby Streams', f'Failed to load links: {exc}',
+            xbmcgui.NOTIFICATION_ERROR, 5000
+        )
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
+
+    xbmcplugin.setContent(HANDLE, 'videos')
+
+    li_refresh = xbmcgui.ListItem(label='[B]⟳ Refresh[/B]')
+    xbmcplugin.addDirectoryItem(HANDLE, BASE_URL + '?action=refresh', li_refresh, True)
+
+    if not links:
+        li = xbmcgui.ListItem(label='No links yet — usually posted shortly before kick-off')
+        xbmcplugin.addDirectoryItem(HANDLE, '', li, False)
+
+    for link in links:
+        host  = urllib.parse.urlparse(link['url']).netloc
+        extra = ' · '.join(x for x in (link['quality'], host) if x)
+        title = f"{link['name']}  [COLOR grey]{extra}[/COLOR]"
+        li = xbmcgui.ListItem(label=title)
+        li.setInfo('video', {'title': link['name'], 'mediatype': 'video'})
+        li.setProperty('IsPlayable', 'true')
+        url = '{}?action=play_viprow&url={}'.format(
+            BASE_URL, urllib.parse.quote(link['url'], safe='')
+        )
+        xbmcplugin.addDirectoryItem(HANDLE, url, li, False)
+
+    xbmcplugin.endOfDirectory(HANDLE)
+
+
+# ---------------------------------------------------------------------------
 # Playback
 # ---------------------------------------------------------------------------
 
 def _poll_for_url(thread, dialog, timeout_ms=60000):
-    """
-    Poll TEMP_URL_FILE until the extractor thread writes a URL or finishes.
-    Returns (stream_url_or_None, cancelled_bool).
-    """
     poll_ms    = 500
     elapsed_ms = 0
     while elapsed_ms < timeout_ms:
@@ -178,7 +285,6 @@ def _poll_for_url(thread, dialog, timeout_ms=60000):
         except OSError:
             pass
         if not thread.is_alive():
-            # Thread finished — do one final read in case the write just landed
             try:
                 with open(TEMP_URL_FILE, 'r') as f:
                     url = f.read().strip()
@@ -194,11 +300,12 @@ def _poll_for_url(thread, dialog, timeout_ms=60000):
     return None, False
 
 
-def play_stream(match_url):
+def play_stream(match_url, extractor=_extractor):
     xbmc.log(f'[rugbystreams] play_stream: {match_url}', xbmc.LOGINFO)
 
     # Shut down any proxy left running from a previous playback
     _extractor.shutdown_proxy()
+    _viprow.shutdown_proxy()
 
     try:
         os.remove(TEMP_URL_FILE)
@@ -209,10 +316,13 @@ def play_stream(match_url):
     dialog.create('Rugby Streams', 'Loading stream...')
     dialog.update(5)
 
+    error_holder = [None]
+
     def _run():
         try:
-            _extractor.extract(match_url, TEMP_URL_FILE)
+            extractor.extract(match_url, TEMP_URL_FILE)
         except Exception as exc:
+            error_holder[0] = str(exc)
             xbmc.log(f'[rugbystreams] extractor error: {exc}', xbmc.LOGERROR)
 
     t = threading.Thread(target=_run, daemon=True)
@@ -226,9 +336,11 @@ def play_stream(match_url):
         return
 
     if not stream_url:
+        msg = error_holder[0] or 'Stream not found'
+        if 'embed config not found' in msg:
+            msg = 'Stream not live yet — no embed found on match page'
         xbmcgui.Dialog().notification(
-            'Rugby Streams', 'Stream not found — check Kodi log for details',
-            xbmcgui.NOTIFICATION_ERROR, 6000
+            'Rugby Streams', msg, xbmcgui.NOTIFICATION_ERROR, 7000
         )
         xbmcplugin.setResolvedUrl(HANDLE, False, xbmcgui.ListItem())
         return
@@ -237,7 +349,24 @@ def play_stream(match_url):
     li = xbmcgui.ListItem(path=stream_url)
     li.setMimeType('application/vnd.apple.mpegurl')
     li.setContentLookup(False)
+    li.setProperty('inputstream', 'inputstream.ffmpegdirect')
+    li.setProperty('inputstream.ffmpegdirect.manifest_type', 'hls')
+    li.setProperty('inputstream.ffmpegdirect.is_realtime_stream', 'true')
+    li.setProperty('inputstream.ffmpegdirect.stream_mode', 'timeshift')
+    li.setProperty('inputstream.ffmpegdirect.open_timeout', '30')
     xbmcplugin.setResolvedUrl(HANDLE, True, li)
+
+    # Keep this script alive while the video plays so the proxy daemon
+    # threads stay alive. Without this Kodi kills the script (and proxy)
+    # after a few minutes.
+    player  = xbmc.Player()
+    monitor = xbmc.Monitor()
+    timeout = 0
+    while not player.isPlaying() and timeout < 20 and not monitor.abortRequested():
+        xbmc.sleep(500)
+        timeout += 1
+    while player.isPlaying() and not monitor.abortRequested():
+        xbmc.sleep(1000)
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +384,20 @@ def router():
         raw = PARAMS.get('url', [None])[0]
         if raw:
             play_stream(urllib.parse.unquote(raw))
+        else:
+            xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+    elif action == 'viprow':
+        list_viprow_games()
+    elif action == 'viprow_game':
+        raw = PARAMS.get('url', [None])[0]
+        if raw:
+            list_viprow_links(urllib.parse.unquote(raw))
+        else:
+            xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+    elif action == 'play_viprow':
+        raw = PARAMS.get('url', [None])[0]
+        if raw:
+            play_stream(urllib.parse.unquote(raw), _viprow)
         else:
             xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
 

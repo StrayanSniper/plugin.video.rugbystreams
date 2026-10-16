@@ -13,7 +13,7 @@ if "%~1"=="" (
 set "MSG=%~1"
 
 set "ADDON_DIR=C:\Users\surfy\AppData\Roaming\Kodi\addons\plugin.video.rugbystreams"
-set "SNIPER_DIR=C:\Users\surfy\Desktop\sniper-repo"
+set "SNIPER_DIR=C:\Users\surfy\sniper-repo"
 set "ADDON_XML=%ADDON_DIR%\addon.xml"
 set "PYTHON=C:\Users\surfy\AppData\Local\Programs\Python\Python313\python.exe"
 
